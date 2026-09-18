@@ -1,0 +1,11 @@
+node_modules/
+data/
+test/
+.git/
+.github/
+.env
+npm-debug.log*
+README.md
+index.html
+manifest.json
+sw.js

@@ -1,0 +1,23 @@
+services:
+  sri-square:
+    image: ${IMAGE:?Set IMAGE to the GitHub Container Registry image tag}
+    container_name: sri-square-operations
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${APP_PORT:-3030}:3030"
+    environment:
+      NODE_ENV: production
+      PORT: 3030
+      DB_PATH: /app/data/sri-square.db
+    volumes:
+      - sri_square_data:/app/data
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3030/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  sri_square_data:
+    name: sri_square_data

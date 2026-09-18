@@ -1,0 +1,20 @@
+{
+  "name": "sri-square-operations",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Local-first operational system for Sri Square Convention.",
+  "main": "server/index.js",
+  "scripts": {
+    "dev": "node --watch server/index.js",
+    "start": "node server/index.js",
+    "test": "node --test test",
+    "check": "node --check server/database.js && node --check server/domain.js && node --check server/index.js && node --check public/app.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.7.0",
+    "express": "^4.21.2"
+  }
+}

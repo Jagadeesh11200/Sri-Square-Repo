@@ -1,0 +1,125 @@
+name: Publish and Deploy Sri Square Operations
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: sri-square-production
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-and-publish:
+    name: Validate, build and publish image
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      image: ${{ steps.image.outputs.tag }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - name: Install locked dependencies
+        run: npm ci
+      - name: Check application syntax
+        run: npm run check
+      - name: Run integration tests
+        run: npm test
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Sign in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Derive immutable image tag
+        id: image
+        run: echo "tag=${REGISTRY}/${IMAGE_NAME}:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+      - name: Build and publish immutable image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ steps.image.outputs.tag }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy-to-docker-host:
+    name: Roll out on the persistent Docker host
+    needs: build-and-publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: production
+    # The job becomes active automatically on every main push after these one-time GitHub secrets are configured.
+    if: ${{ secrets.DEPLOY_HOST != '' && secrets.DEPLOY_USER != '' && secrets.DEPLOY_SSH_KEY != '' && secrets.DEPLOY_KNOWN_HOSTS != '' && secrets.GHCR_PULL_USERNAME != '' && secrets.GHCR_PULL_TOKEN != '' }}
+    steps:
+      - name: Check out deployment definition
+        uses: actions/checkout@v4
+      - name: Configure trusted SSH connection
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
+      - name: Assemble deployment environment
+        env:
+          IMAGE: ${{ needs.build-and-publish.outputs.image }}
+          GHCR_PULL_USERNAME: ${{ secrets.GHCR_PULL_USERNAME }}
+          GHCR_PULL_TOKEN: ${{ secrets.GHCR_PULL_TOKEN }}
+          APP_PORT: ${{ vars.SRI_SQUARE_APP_PORT || '3030' }}
+        run: |
+          printf 'IMAGE=%s\nAPP_PORT=%s\n' "$IMAGE" "$APP_PORT" > "$RUNNER_TEMP/sri-square.env"
+          printf '%s' "$GHCR_PULL_USERNAME" > "$RUNNER_TEMP/ghcr-user"
+          printf '%s' "$GHCR_PULL_TOKEN" > "$RUNNER_TEMP/ghcr-token"
+      - name: Upload production definition
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_PORT: ${{ vars.DEPLOY_PORT || '22' }}
+        run: |
+          ssh -p "$DEPLOY_PORT" "$DEPLOY_USER@$DEPLOY_HOST" 'mkdir -p ~/sri-square'
+          scp -P "$DEPLOY_PORT" compose.production.yml "$DEPLOY_USER@$DEPLOY_HOST:~/sri-square/compose.production.yml"
+          scp -P "$DEPLOY_PORT" "$RUNNER_TEMP/sri-square.env" "$DEPLOY_USER@$DEPLOY_HOST:~/sri-square/.env"
+          scp -P "$DEPLOY_PORT" "$RUNNER_TEMP/ghcr-user" "$RUNNER_TEMP/ghcr-token" "$DEPLOY_USER@$DEPLOY_HOST:~/sri-square/"
+      - name: Deploy immutable image and verify health
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_PORT: ${{ vars.DEPLOY_PORT || '22' }}
+        run: |
+          ssh -p "$DEPLOY_PORT" "$DEPLOY_USER@$DEPLOY_HOST" 'bash -s' <<'REMOTE'
+            set -eu
+            cd ~/sri-square
+            trap 'rm -f ghcr-user ghcr-token' EXIT
+            docker login ghcr.io --username "$(cat ghcr-user)" --password-stdin < ghcr-token
+            docker compose -f compose.production.yml pull
+            docker compose -f compose.production.yml up -d --remove-orphans
+            for attempt in $(seq 1 20); do
+              if docker inspect --format='{{.State.Health.Status}}' sri-square-operations 2>/dev/null | grep -qx healthy; then
+                docker image prune -f
+                exit 0
+              fi
+              sleep 3
+            done
+            docker compose -f compose.production.yml logs --tail=100
+            exit 1
+          REMOTE
